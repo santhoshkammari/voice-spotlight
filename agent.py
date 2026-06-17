@@ -1,5 +1,5 @@
 """
-MAF agent wired to GPU4 Qwen3-27B.
+MAF agent wired to Qwen3-27B.
 Streams token deltas via Runner.run_streamed().
 """
 
@@ -20,8 +20,10 @@ from openai.types.responses import ResponseTextDeltaEvent
 
 from tools import all_tools
 
-BASE_URL = "http://192.168.170.49:8077/v1"
-MODEL_ID = "/home/ng6355/models/qwen3-6-27b"
+import os
+
+BASE_URL = os.environ.get("LLM_BASE_URL", "http://0.0.0.0:8077/v1")
+MODEL_ID = os.environ.get("LLM_MODEL_ID", "qwen3-6-27b")
 
 set_tracing_disabled(True)
 

@@ -122,7 +122,7 @@ def _stream_answer(hud, question):
     # finally:
     #     hud.emitter.done.emit()
 
-    # ── MAF agent backend (GPU4 Qwen3-27B, real tool use, streaming) ──
+    # ── MAF agent backend (Qwen3-27B, real tool use, streaming) ──
     from agent import stream_answer as agent_stream
     agent_stream(
         question,

@@ -16,7 +16,7 @@ voice-spotlight — voice-activated HUD for streaming AI answers.
   - 4 ONNX sessions: nemo, encoder, decoder, vocab.txt
   - Resamples to 16kHz via scipy.signal.resample_poly
 
-- **agent.py** — MAF agent (OpenAI Agents SDK) → GPU4 Qwen3-27B.
+- **agent.py** — MAF agent (OpenAI Agents SDK) → Qwen3-27B.
   - `stream_answer(question, on_token, on_done)` — blocking, call in thread
   - Maintains rolling 20-turn history in-memory
   - Uses tool set from `tools.py`
@@ -44,7 +44,7 @@ voice-spotlight — voice-activated HUD for streaming AI answers.
 ```
 mic → stt.transcribe() → agent_stream(question, ...) → ui.HUD
      ↑                    ↑                              ↑
-  local ONNX          GPU4 Qwen3-27B                 PyQt5 overlay
+  local ONNX          Qwen3-27B                      PyQt5 overlay
 ```
 
 ## config
@@ -62,7 +62,7 @@ ddgs (duckduckgo-search), scrot
 
 ## gotchas
 
-- Agent runs on GPU4 (`192.168.170.49:8077`) — requires NT VPN
+- Agent endpoint is set via `LLM_BASE_URL` env var
 - STT models are machine-local, not in repo
 - HUD uses X11BypassWindowManagerHint — Wayland untested
 - Parallel recordings not supported (single-threaded voice loop)

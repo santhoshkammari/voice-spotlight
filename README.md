@@ -19,7 +19,7 @@ intersection.
 ```
 F9 hold  →  mic capture @ native sample rate
 release  →  Parakeet TDT ONNX (local, ~500ms)
-         →  QA agent on GPU4 Qwen3-27B (streamed)
+         →  QA agent on Qwen3-27B (streamed)
          →  PyQt5 overlay, top-center, 860×220
          →  auto-collapse after 12s idle
 ```
@@ -30,7 +30,7 @@ release  →  Parakeet TDT ONNX (local, ~500ms)
 |-----------|------|
 | `run.py`  | daemon — PID file, signal handling, voice loop |
 | `stt.py`  | Parakeet TDT ONNX — local speech-to-text |
-| `agent.py`| MAF agent wired to GPU4 Qwen3-27B, streaming |
+| `agent.py`| MAF agent wired to Qwen3-27B, streaming |
 | `ui.py`   | PyQt5 transparent HUD, cyberpunk paint |
 | `tools.py`| bash/read/write/edit/glob/grep/web/screenshot tools for agent |
 | `opencode.py` | alternative agent backend (opencode subprocess) |
@@ -51,7 +51,7 @@ top of your screen when it's ready.
 - PyQt5 (HUD)
 - ONNX Runtime + Parakeet TDT (STT)
 - OpenAI Agents SDK (agent framework)
-- Qwen3-27B on GPU4 (inference)
+- Qwen3-27B (inference)
 
 ## philosophy
 

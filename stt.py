@@ -7,9 +7,10 @@ Usage:
 """
 
 import argparse
+import os
 import numpy as np
 
-MODEL_DIR   = "/home/ntlpt24/.local/share/com.pais.handy/models/parakeet-tdt-0.6b-v3-int8"
+MODEL_DIR   = os.environ.get("STT_MODEL_DIR", os.path.expanduser("~/.local/share/com.pais.handy/models/parakeet-tdt-0.6b-v3-int8"))
 SAMPLE_RATE = 16000
 BLANK_ID    = 8192
 EOT_ID      = 3

@@ -10,7 +10,7 @@ def _opencode_bin() -> str:
     found = shutil.which("opencode")
     if found:
         return found
-    return "/home/ntlpt24/.opencode/bin/opencode"
+    return os.path.expanduser("~/.opencode/bin/opencode")
 
 
 def opencode_stream(prompt: str, model: str = None, cancel_event: threading.Event = None) -> Iterator[str]:

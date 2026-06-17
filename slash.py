@@ -10,7 +10,7 @@ def _opencode_bin() -> str:
     found = shutil.which("opencode")
     if found:
         return found
-    return "/home/ntlpt24/.opencode/bin/opencode"
+    return os.path.expanduser("~/.opencode/bin/opencode")
 CONFIG_DIR = os.path.expanduser("~/.spotlight")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 DEFAULT_MODEL = "opencode/deepseek-v4-flash-free"

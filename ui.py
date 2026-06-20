@@ -54,7 +54,8 @@ class HUD(QWidget):
         self._dot_phase  = 0
         self._agents     = []
         self._cur_h      = MIN_H
-        self._scroll_y   = 0    # pixels scrolled from top of content
+        self._scroll_y      = 0    # pixels scrolled from top of content
+        self._user_scrolled = False  # True once user manually scrolls up
         self.emitter     = Emitter()
 
         self._build()
@@ -64,7 +65,7 @@ class HUD(QWidget):
     def _build(self):
         self.setWindowFlags(
             Qt.FramelessWindowHint
-            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle("Voice Spotlight")
@@ -109,8 +110,9 @@ class HUD(QWidget):
         self._recording = True
         self._text = ""
         self._scroll_y = 0
+        self._user_scrolled = False
         self._collapse_timer.stop()
-        self._set_height(MIN_H)
+        self._set_height(MIN_H, animate=False)
         self.show()
         self.update()
 
@@ -157,9 +159,10 @@ class HUD(QWidget):
         """Total rendered height of current text content in pixels."""
         if not self._text:
             return 0
-        fm = QFontMetrics(QFont(FONT_UI, 13))
+        fm      = QFontMetrics(QFont(FONT_UI, 13))
+        line_h  = fm.height() + 4   # +4 matches mdrender line_gap
         avail_w = self.width() - PAD_H * 2
-        lines = 0
+        lines   = 0
         for para in self._text.split("\n"):
             if not para:
                 lines += 1
@@ -167,11 +170,13 @@ class HUD(QWidget):
             adv = fm.horizontalAdvance(para)
             lines += max(1, (adv + avail_w - 1) // avail_w)
         agent_h = (len(self._agents) * 36 + 12) if self._agents else 0
-        return PAD_TOP + lines * LINE_H + PAD_BOT + agent_h
+        return PAD_TOP + lines * line_h + PAD_BOT + agent_h
 
     def _autoscroll_to_bottom(self):
-        """Push scroll offset so the latest content is always visible."""
-        viewport_h = min(self._cur_h, MAX_H) - PAD_TOP - PAD_BOT
+        """Push scroll offset so latest content is visible — unless user scrolled up."""
+        if self._user_scrolled:
+            return
+        viewport_h = self.height() - PAD_TOP - PAD_BOT
         total_h    = self._content_height() - PAD_TOP - PAD_BOT
         self._scroll_y = max(0, total_h - viewport_h)
 
@@ -183,9 +188,10 @@ class HUD(QWidget):
             else:
                 self._set_height(MIN_H)
             return
-        fm = QFontMetrics(QFont(FONT_MONO, 13))
+        fm      = QFontMetrics(QFont(FONT_UI, 13))
+        line_h  = fm.height() + 4
         avail_w = self.width() - PAD_H * 2
-        lines = 0
+        lines   = 0
         for para in self._text.split("\n"):
             if not para:
                 lines += 1
@@ -193,19 +199,23 @@ class HUD(QWidget):
             adv = fm.horizontalAdvance(para)
             lines += max(1, (adv + avail_w - 1) // avail_w)
         agent_h = (len(self._agents) * 36 + 12) if self._agents else 0
-        needed = PAD_TOP + lines * LINE_H + PAD_BOT + agent_h
+        needed  = PAD_TOP + lines * line_h + PAD_BOT + agent_h
         h = max(MIN_H, min(needed, MAX_H))
         self._set_height(int(h))
 
-    def _set_height(self, h):
-        if self._cur_h == h:
+    def _set_height(self, h, animate=True):
+        if abs(self._cur_h - h) < 2:
             return
         self._cur_h = h
+        cur = self.geometry()
+        if not animate or self._expanded:
+            # instant resize while streaming — no animation thrash
+            self.setGeometry(cur.x(), cur.y(), cur.width(), h)
+            return
         if hasattr(self, "_anim_geo") and self._anim_geo.state() == QPropertyAnimation.Running:
             self._anim_geo.stop()
-        cur = self.geometry()
         self._anim_geo = QPropertyAnimation(self, b"geometry")
-        self._anim_geo.setDuration(180)
+        self._anim_geo.setDuration(160)
         self._anim_geo.setStartValue(QRect(cur.x(), cur.y(), cur.width(), cur.height()))
         self._anim_geo.setEndValue(QRect(cur.x(), cur.y(), cur.width(), h))
         self._anim_geo.setEasingCurve(QEasingCurve.OutCubic)
@@ -215,6 +225,7 @@ class HUD(QWidget):
         self._text = ""
         self._recording = False
         self._scroll_y = 0
+        self._user_scrolled = False
         if self._agents:
             # keep showing agent panel
             self._expanded = True
@@ -454,8 +465,10 @@ class HUD(QWidget):
         delta = e.angleDelta().y()
         step  = 40
         self._scroll_y -= int(delta / 120) * step
-        # clamp: 0 = top, max = content overflows viewport
         viewport_h = self.height() - PAD_TOP - PAD_BOT
         total_h    = self._content_height() - PAD_TOP - PAD_BOT
-        self._scroll_y = max(0, min(self._scroll_y, max(0, total_h - viewport_h)))
+        max_scroll = max(0, total_h - viewport_h)
+        self._scroll_y = max(0, min(self._scroll_y, max_scroll))
+        # if user scrolled up from bottom, stop auto-scroll
+        self._user_scrolled = self._scroll_y < max_scroll
         self.update()

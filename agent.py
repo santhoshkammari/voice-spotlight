@@ -1,15 +1,13 @@
 """
 Voice-HUD agent — Qwen3-27B primary, opencode fallback.
-
-Uses framework-native SQLiteSession for persistent history + compaction.
-Cancellation via stream.cancel() (framework-native).
+Simple: manual history list, plain asyncio.run, no SQLiteSession.
 """
 
 import asyncio
 import json
 import threading
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 from openai import AsyncOpenAI
 from agents import (
@@ -19,20 +17,20 @@ from agents import (
     set_default_openai_client,
     set_tracing_disabled,
 )
-from agents.memory.sqlite_session import SQLiteSession
-from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
+from agents.stream_events import RawResponsesStreamEvent
 from openai.types.responses import ResponseTextDeltaEvent
+from agents import function_tool as tool
+from typing import Annotated
 
 from tools import all_tools
 import session as sess_mgr
 
 import os
 
-BASE_URL        = os.environ.get("LLM_BASE_URL", "http://192.168.170.49:8077/v1")
-MODEL_ID        = os.environ.get("LLM_MODEL_ID", "/home/ng6355/models/qwen3-6-27b")
-VLM_MAX_TOKENS  = 250000
-DB_PATH         = Path.home() / ".voice-spotlight" / "sessions.db"
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+BASE_URL       = os.environ.get("LLM_BASE_URL", "http://192.168.170.49:8077/v1")
+MODEL_ID       = os.environ.get("LLM_MODEL_ID", "/home/ng6355/models/qwen3-6-27b")
+MAX_TOKENS     = 200000   # conservative cap, no HTTP fetch needed
+MAX_HISTORY    = 20       # messages to keep
 
 set_tracing_disabled(True)
 
@@ -47,9 +45,6 @@ SETTINGS = ModelSettings(
 
 
 # ── session tools ─────────────────────────────────────────────────────────────
-
-from agents import function_tool as tool
-from typing import Annotated
 
 @tool
 def list_sessions_tool() -> str:
@@ -69,28 +64,22 @@ def list_sessions_tool() -> str:
 def read_session_tool(
     session_id: Annotated[str, "Session ID from list_sessions_tool"],
 ) -> str:
-    """Read the messages from a past session."""
+    """Read messages from a past session."""
     data = sess_mgr.read_session(session_id)
     if not data:
         return f"Session {session_id} not found."
-    msgs = data.get("messages", [])
     lines = [f"Session: {data['title']}"]
-    for m in msgs:
-        role = m["role"].upper()
+    for m in data.get("messages", []):
         content = m["content"][:300] + ("…" if len(m["content"]) > 300 else "")
-        lines.append(f"\n[{role}] {content}")
+        lines.append(f"\n[{m['role'].upper()}] {content}")
     return "\n".join(lines)
 
 
 @tool
 def new_session_tool() -> str:
-    """Start a fresh conversation session, archiving the current one."""
+    """Start a fresh conversation session."""
     _reset_session()
     return "Started new session."
-
-
-def _all_tools():
-    return all_tools() + [list_sessions_tool, read_session_tool, new_session_tool]
 
 
 _agent = Agent(
@@ -99,79 +88,69 @@ _agent = Agent(
         "You are Santhosh's personal AI assistant running on his laptop. "
         "You have full access to his system via bash, file read/write, web search, and screenshot tools. "
         "You remember past conversations — use list_sessions_tool / read_session_tool to recall them. "
-        "Say 'starting fresh session' then call new_session_tool if asked to reset. "
+        "Call new_session_tool if asked to reset. "
         "Be concise and direct. No filler."
     ),
     model=MODEL,
     model_settings=SETTINGS,
-    tools=_all_tools(),
+    tools=all_tools() + [list_sessions_tool, read_session_tool, new_session_tool],
 )
 
 
-# ── SQLite session (framework-native persistence) ─────────────────────────────
+# ── history ───────────────────────────────────────────────────────────────────
 
-_session_lock  = threading.Lock()
-_current_sid   = ""
-_sql_session: Optional[SQLiteSession] = None
+_history: list[dict] = []
+_history_lock = threading.Lock()
+_current_session: dict = {}
 
 
-def _get_or_create_session() -> SQLiteSession:
-    global _current_sid, _sql_session
-    # load/create the meta session pointer
-    meta = sess_mgr.load_current()
-    sid  = meta["id"]
-    if _sql_session is None or _current_sid != sid:
-        _sql_session = SQLiteSession(session_id=sid, db_path=DB_PATH)
-        _current_sid = sid
-    return _sql_session
+def _load_session() -> None:
+    global _current_session, _history
+    data = sess_mgr.load_current()
+    _current_session = data
+    _history = list(data.get("messages", []))
+
+
+def _save() -> None:
+    sid = _current_session.get("id")
+    if sid:
+        sess_mgr.save_messages(sid, list(_history))
 
 
 def _reset_session() -> None:
-    global _sql_session, _current_sid
-    with _session_lock:
-        sess_mgr.new_session()
-        _sql_session  = None
-        _current_sid  = ""
+    global _current_session, _history
+    with _history_lock:
+        _save()
+        _current_session = sess_mgr.new_session()
+        _history = []
 
 
-# init on import
-_get_or_create_session()
+_load_session()
 
 
-# ── VLM max tokens ────────────────────────────────────────────────────────────
-
-def _fetch_vlm_max_tokens() -> int:
-    try:
-        import httpx
-        r = httpx.get(f"{BASE_URL}/models", timeout=3)
-        for m in r.json().get("data", []):
-            if "max_model_len" in m:
-                return int(m["max_model_len"])
-    except Exception:
-        pass
-    return VLM_MAX_TOKENS
-
-_vlm_max = _fetch_vlm_max_tokens()
-
-
-# ── GPU / Qwen3 streaming ─────────────────────────────────────────────────────
+# ── streaming ─────────────────────────────────────────────────────────────────
 
 async def _run_stream(
     question: str,
     on_token: Callable[[str], None],
     cancel_event=None,
 ) -> None:
-    sql = _get_or_create_session()
+    with _history_lock:
+        msgs = list(_history)
+
+    # simple rolling window — no HTTP fetch for token count
+    while len(msgs) > MAX_HISTORY:
+        msgs.pop(0)
+
+    input_msgs = msgs + [{"role": "user", "content": question}]
     full = ""
     interrupted = False
 
-    # pass session= so framework handles history + compaction automatically
-    stream = Runner.run_streamed(_agent, question, session=sql)
-
+    stream = Runner.run_streamed(_agent, input_msgs)
     async for event in stream.stream_events():
         if cancel_event and cancel_event.is_set() and not interrupted:
             interrupted = True
-            stream.cancel()   # framework-native immediate cancel
+            stream.cancel()
         if isinstance(event, RawResponsesStreamEvent):
             data = event.data
             if isinstance(data, ResponseTextDeltaEvent):
@@ -183,8 +162,13 @@ async def _run_stream(
         full += "\n\n*[interrupted]*"
         on_token(full)
 
+    with _history_lock:
+        _history.append({"role": "user",      "content": question})
+        _history.append({"role": "assistant",  "content": full})
+        while len(_history) > MAX_HISTORY:
+            _history.pop(0)
+        _save()
 
-# ── GPU reachability ──────────────────────────────────────────────────────────
 
 def _gpu_reachable() -> bool:
     import socket
@@ -196,31 +180,14 @@ def _gpu_reachable() -> bool:
         return False
 
 
-# ── opencode fallback ─────────────────────────────────────────────────────────
-
-# separate history list for opencode (no SQLiteSession support there)
-_oc_history: list[dict] = []
-_oc_lock = threading.Lock()
-
 def _opencode_stream(
     question: str,
     on_token: Callable[[str], None],
     cancel_event=None,
 ) -> None:
     import subprocess
-    from session import compress_if_needed, OPENCODE_MAX_TOKENS
-
-    with _oc_lock:
-        msgs = compress_if_needed(list(_oc_history), OPENCODE_MAX_TOKENS)
-        # opencode takes the last user message as the prompt; history via context prefix
-        context = "\n".join(
-            f"{'User' if m['role']=='user' else 'Assistant'}: {m['content']}"
-            for m in msgs[-10:]
-        )
-        full_prompt = f"{context}\nUser: {question}" if context else question
-
     cmd = [
-        "/home/ntlpt24/.opencode/bin/opencode", "run", full_prompt,
+        "/home/ntlpt24/.opencode/bin/opencode", "run", question,
         "--model", "opencode/deepseek-v4-flash-free",
         "--format", "json",
     ]
@@ -247,15 +214,13 @@ def _opencode_stream(
         full += "\n\n*[interrupted]*"
         on_token(full)
 
-    with _oc_lock:
-        _oc_history.append({"role": "user",      "content": question})
-        _oc_history.append({"role": "assistant",  "content": full})
-        compressed = compress_if_needed(_oc_history, OPENCODE_MAX_TOKENS)
-        _oc_history.clear()
-        _oc_history.extend(compressed)
+    with _history_lock:
+        _history.append({"role": "user",      "content": question})
+        _history.append({"role": "assistant",  "content": full})
+        while len(_history) > MAX_HISTORY:
+            _history.pop(0)
+        _save()
 
-
-# ── public API ────────────────────────────────────────────────────────────────
 
 def stream_answer(
     question: str,

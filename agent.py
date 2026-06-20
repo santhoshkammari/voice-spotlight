@@ -1,11 +1,15 @@
 """
-MAF agent wired to Qwen3-27B with session persistence + auto context compression.
+Voice-HUD agent — Qwen3-27B primary, opencode fallback.
+
+Uses framework-native SQLiteSession for persistent history + compaction.
+Cancellation via stream.cancel() (framework-native).
 """
 
 import asyncio
 import json
 import threading
-from typing import Callable
+from pathlib import Path
+from typing import Callable, Optional
 
 from openai import AsyncOpenAI
 from agents import (
@@ -15,17 +19,20 @@ from agents import (
     set_default_openai_client,
     set_tracing_disabled,
 )
-from agents.stream_events import RawResponsesStreamEvent
+from agents.memory.sqlite_session import SQLiteSession
+from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
 from openai.types.responses import ResponseTextDeltaEvent
 
 from tools import all_tools
-import session as sess
+import session as sess_mgr
 
 import os
 
-BASE_URL  = os.environ.get("LLM_BASE_URL", "http://192.168.170.49:8077/v1")
-MODEL_ID  = os.environ.get("LLM_MODEL_ID", "/home/ng6355/models/qwen3-6-27b")
-VLM_MAX_TOKENS = 250000   # fetched from /v1/models at startup
+BASE_URL        = os.environ.get("LLM_BASE_URL", "http://192.168.170.49:8077/v1")
+MODEL_ID        = os.environ.get("LLM_MODEL_ID", "/home/ng6355/models/qwen3-6-27b")
+VLM_MAX_TOKENS  = 250000
+DB_PATH         = Path.home() / ".voice-spotlight" / "sessions.db"
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 set_tracing_disabled(True)
 
@@ -39,7 +46,7 @@ SETTINGS = ModelSettings(
 )
 
 
-# ── session tools (agent can list/read/reset sessions) ────────────────────────
+# ── session tools ─────────────────────────────────────────────────────────────
 
 from agents import function_tool as tool
 from typing import Annotated
@@ -47,12 +54,12 @@ from typing import Annotated
 @tool
 def list_sessions_tool() -> str:
     """List past conversation sessions."""
-    sessions = sess.list_sessions()
+    sessions = sess_mgr.list_sessions()
     if not sessions:
         return "No past sessions."
+    import time
     lines = []
     for s in sessions:
-        import time
         t = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["started"])) if s.get("started") else "?"
         lines.append(f"[{s['id']}] {t} — {s['title']} ({s['message_count']} msgs)")
     return "\n".join(lines)
@@ -63,7 +70,7 @@ def read_session_tool(
     session_id: Annotated[str, "Session ID from list_sessions_tool"],
 ) -> str:
     """Read the messages from a past session."""
-    data = sess.read_session(session_id)
+    data = sess_mgr.read_session(session_id)
     if not data:
         return f"Session {session_id} not found."
     msgs = data.get("messages", [])
@@ -101,78 +108,83 @@ _agent = Agent(
 )
 
 
-# ── session state ─────────────────────────────────────────────────────────────
+# ── SQLite session (framework-native persistence) ─────────────────────────────
 
-_session_lock = threading.Lock()
-_current_session: dict = {}
-_history: list[dict] = []
-
-
-def _load_session() -> None:
-    global _current_session, _history
-    data = sess.load_current()
-    _current_session = data
-    _history = list(data.get("messages", []))
+_session_lock  = threading.Lock()
+_current_sid   = ""
+_sql_session: Optional[SQLiteSession] = None
 
 
-def _save() -> None:
-    sid = _current_session.get("id")
-    if sid:
-        sess.save_messages(sid, list(_history))
+def _get_or_create_session() -> SQLiteSession:
+    global _current_sid, _sql_session
+    # load/create the meta session pointer
+    meta = sess_mgr.load_current()
+    sid  = meta["id"]
+    if _sql_session is None or _current_sid != sid:
+        _sql_session = SQLiteSession(session_id=sid, db_path=DB_PATH)
+        _current_sid = sid
+    return _sql_session
 
 
 def _reset_session() -> None:
-    global _current_session, _history
+    global _sql_session, _current_sid
     with _session_lock:
-        _save()
-        data = sess.new_session()
-        _current_session = data
-        _history = []
+        sess_mgr.new_session()
+        _sql_session  = None
+        _current_sid  = ""
 
 
-# load on import
-_load_session()
+# init on import
+_get_or_create_session()
 
 
-# ── VLM max tokens (fetched once) ─────────────────────────────────────────────
+# ── VLM max tokens ────────────────────────────────────────────────────────────
 
 def _fetch_vlm_max_tokens() -> int:
     try:
         import httpx
         r = httpx.get(f"{BASE_URL}/models", timeout=3)
-        data = r.json()
-        for m in data.get("data", []):
+        for m in r.json().get("data", []):
             if "max_model_len" in m:
                 return int(m["max_model_len"])
     except Exception:
         pass
     return VLM_MAX_TOKENS
 
-
 _vlm_max = _fetch_vlm_max_tokens()
 
 
-# ── streaming ─────────────────────────────────────────────────────────────────
+# ── GPU / Qwen3 streaming ─────────────────────────────────────────────────────
 
-async def _run_stream(question: str, on_token: Callable[[str], None]) -> None:
-    with _session_lock:
-        msgs = sess.compress_if_needed(list(_history), _vlm_max)
-        input_msgs = msgs + [{"role": "user", "content": question}]
-
+async def _run_stream(
+    question: str,
+    on_token: Callable[[str], None],
+    cancel_event=None,
+) -> None:
+    sql = _get_or_create_session()
     full = ""
-    stream = Runner.run_streamed(_agent, input_msgs)
+    interrupted = False
+
+    # pass session= so framework handles history + compaction automatically
+    stream = Runner.run_streamed(_agent, question, session=sql)
+
     async for event in stream.stream_events():
+        if cancel_event and cancel_event.is_set() and not interrupted:
+            interrupted = True
+            stream.cancel()   # framework-native immediate cancel
         if isinstance(event, RawResponsesStreamEvent):
             data = event.data
             if isinstance(data, ResponseTextDeltaEvent):
                 full += data.delta
-                on_token(full)
+                if not interrupted:
+                    on_token(full)
 
-    with _session_lock:
-        _history.append({"role": "user",      "content": question})
-        _history.append({"role": "assistant",  "content": full})
-        _save()
+    if interrupted and full:
+        full += "\n\n*[interrupted]*"
+        on_token(full)
 
+
+# ── GPU reachability ──────────────────────────────────────────────────────────
 
 def _gpu_reachable() -> bool:
     import socket
@@ -184,43 +196,80 @@ def _gpu_reachable() -> bool:
         return False
 
 
-def _opencode_stream(question: str, on_token: Callable[[str], None]) -> None:
+# ── opencode fallback ─────────────────────────────────────────────────────────
+
+# separate history list for opencode (no SQLiteSession support there)
+_oc_history: list[dict] = []
+_oc_lock = threading.Lock()
+
+def _opencode_stream(
+    question: str,
+    on_token: Callable[[str], None],
+    cancel_event=None,
+) -> None:
+    import subprocess
+    from session import compress_if_needed, OPENCODE_MAX_TOKENS
+
+    with _oc_lock:
+        msgs = compress_if_needed(list(_oc_history), OPENCODE_MAX_TOKENS)
+        # opencode takes the last user message as the prompt; history via context prefix
+        context = "\n".join(
+            f"{'User' if m['role']=='user' else 'Assistant'}: {m['content']}"
+            for m in msgs[-10:]
+        )
+        full_prompt = f"{context}\nUser: {question}" if context else question
+
     cmd = [
-        "/home/ntlpt24/.opencode/bin/opencode", "run", question,
+        "/home/ntlpt24/.opencode/bin/opencode", "run", full_prompt,
         "--model", "opencode/deepseek-v4-flash-free",
         "--format", "json",
     ]
-    import subprocess
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                            cwd="/home/ntlpt24")
+                            stdin=subprocess.DEVNULL, cwd="/home/ntlpt24")
     full = ""
+    interrupted = False
     for line in proc.stdout:
+        if cancel_event and cancel_event.is_set():
+            interrupted = True
+            proc.kill()
+            break
         try:
             obj = json.loads(line)
             if obj.get("type") == "text":
                 full += obj["part"]["text"]
-                on_token(full)
+                if not interrupted:
+                    on_token(full)
         except Exception:
             pass
     proc.wait()
-    with _session_lock:
-        _history.append({"role": "user",      "content": question})
-        _history.append({"role": "assistant",  "content": full})
-        # compress opencode history at 75% of its max
-        compressed = sess.compress_if_needed(_history, sess.OPENCODE_MAX_TOKENS)
-        _history.clear()
-        _history.extend(compressed)
-        _save()
+
+    if interrupted and full:
+        full += "\n\n*[interrupted]*"
+        on_token(full)
+
+    with _oc_lock:
+        _oc_history.append({"role": "user",      "content": question})
+        _oc_history.append({"role": "assistant",  "content": full})
+        compressed = compress_if_needed(_oc_history, OPENCODE_MAX_TOKENS)
+        _oc_history.clear()
+        _oc_history.extend(compressed)
 
 
-def stream_answer(question: str, on_token: Callable[[str], None], on_done: Callable[[], None]) -> None:
+# ── public API ────────────────────────────────────────────────────────────────
+
+def stream_answer(
+    question: str,
+    on_token: Callable[[str], None],
+    on_done: Callable[[], None],
+    cancel_event=None,
+) -> None:
     def _go():
         try:
             if _gpu_reachable():
-                asyncio.run(_run_stream(question, on_token))
+                asyncio.run(_run_stream(question, on_token, cancel_event))
             else:
                 on_token("[GPU offline → opencode]\n\n")
-                _opencode_stream(question, on_token)
+                _opencode_stream(question, on_token, cancel_event)
         except Exception as e:
             on_token(f"[error: {e}]")
         finally:

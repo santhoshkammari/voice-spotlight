@@ -52,8 +52,9 @@ class HUD(QWidget):
         self._recording  = False
         self._expanded   = False
         self._dot_phase  = 0
-        self._agents     = []           # latest agent list for status panel
+        self._agents     = []
         self._cur_h      = MIN_H
+        self._scroll_y   = 0    # pixels scrolled from top of content
         self.emitter     = Emitter()
 
         self._build()
@@ -107,6 +108,7 @@ class HUD(QWidget):
     def _on_recording_start(self):
         self._recording = True
         self._text = ""
+        self._scroll_y = 0
         self._collapse_timer.stop()
         self._set_height(MIN_H)
         self.show()
@@ -121,6 +123,7 @@ class HUD(QWidget):
         self._collapse_timer.stop()
         self._expanded = True
         self._reflow_height()
+        self._autoscroll_to_bottom()
         self.show()
         self.update()
 
@@ -149,6 +152,28 @@ class HUD(QWidget):
         self.update()
 
     # ── layout ────────────────────────────────────────────────────────────────
+
+    def _content_height(self) -> int:
+        """Total rendered height of current text content in pixels."""
+        if not self._text:
+            return 0
+        fm = QFontMetrics(QFont(FONT_UI, 13))
+        avail_w = self.width() - PAD_H * 2
+        lines = 0
+        for para in self._text.split("\n"):
+            if not para:
+                lines += 1
+                continue
+            adv = fm.horizontalAdvance(para)
+            lines += max(1, (adv + avail_w - 1) // avail_w)
+        agent_h = (len(self._agents) * 36 + 12) if self._agents else 0
+        return PAD_TOP + lines * LINE_H + PAD_BOT + agent_h
+
+    def _autoscroll_to_bottom(self):
+        """Push scroll offset so the latest content is always visible."""
+        viewport_h = min(self._cur_h, MAX_H) - PAD_TOP - PAD_BOT
+        total_h    = self._content_height() - PAD_TOP - PAD_BOT
+        self._scroll_y = max(0, total_h - viewport_h)
 
     def _reflow_height(self):
         if not self._text:
@@ -189,6 +214,7 @@ class HUD(QWidget):
     def _collapse(self):
         self._text = ""
         self._recording = False
+        self._scroll_y = 0
         if self._agents:
             # keep showing agent panel
             self._expanded = True
@@ -278,27 +304,34 @@ class HUD(QWidget):
             p.end()
             return
 
-        # text (+ maybe agents below) — rendered as markdown
+        # text (+ maybe agents below) — rendered as markdown with scroll
         tx = PAD_H
-        ty = PAD_TOP
         tw = w - PAD_H * 2
         agent_panel_h = (len(self._agents) * 36 + 12) if self._agents else 0
-        th = h - PAD_TOP - PAD_BOT - agent_panel_h
+        # clip text area — agents strip is pinned at bottom
+        text_viewport_h = h - PAD_TOP - PAD_BOT - agent_panel_h
+
+        # clip to text viewport so text doesn't bleed into agent strip or top bar
+        p.setClipRect(tx, PAD_TOP, tw, text_viewport_h)
 
         base_font = QFont(FONT_UI, 13)
+        # offset ty by negative scroll so content scrolls up
+        ty = PAD_TOP - self._scroll_y
         end_y = mdrender.draw(
             p, self._text,
-            tx, ty, tw, th,
+            tx, ty, tw, text_viewport_h + self._scroll_y,
             base_font, C_TEXT, C_DIM, C_CODE_BG, C_ACCENT,
         )
 
-        # blinking cursor after last rendered line
-        if self._dot_phase < 30:
+        # blinking cursor after last rendered line (only if in viewport)
+        if self._dot_phase < 30 and end_y > PAD_TOP:
             p.setPen(C_CURSOR)
             p.setFont(QFont(FONT_MONO, 13))
             p.drawText(tx, end_y, "▎")
 
-        # agent strip at bottom when text + agents coexist
+        p.setClipping(False)
+
+        # agent strip pinned at bottom
         if self._agents:
             strip_y = h - agent_panel_h
             p.setPen(QPen(C_DIVIDER, 1))
@@ -416,3 +449,13 @@ class HUD(QWidget):
     def mouseReleaseEvent(self, e):
         self._drag_pos = None
         self._resize_edge = None
+
+    def wheelEvent(self, e):
+        delta = e.angleDelta().y()
+        step  = 40
+        self._scroll_y -= int(delta / 120) * step
+        # clamp: 0 = top, max = content overflows viewport
+        viewport_h = self.height() - PAD_TOP - PAD_BOT
+        total_h    = self._content_height() - PAD_TOP - PAD_BOT
+        self._scroll_y = max(0, min(self._scroll_y, max(0, total_h - viewport_h)))
+        self.update()

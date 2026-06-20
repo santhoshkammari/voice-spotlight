@@ -51,9 +51,14 @@ def _voice_loop(hud):
     import sounddevice as sd
     from pynput import keyboard
     import stt
+    from textclean import audio_ok, clean
+    from agent import stream_answer as agent_stream
 
     device_info = sd.query_devices(kind="input")
     native_rate = int(device_info["default_samplerate"])
+
+    # shared cancel token — set to interrupt current LLM stream
+    cancel_event = threading.Event()
 
     while True:
         frames      = []
@@ -69,6 +74,8 @@ def _voice_loop(hud):
 
         def on_press(key):
             if key == keyboard.Key.f9 and not recording[0]:
+                # cancel any in-progress LLM stream before starting mic
+                cancel_event.set()
                 recording[0] = True
                 hud.emitter.show_recording.emit()
                 stream_ref[0] = sd.InputStream(
@@ -95,36 +102,29 @@ def _voice_loop(hud):
         if not frames:
             continue
 
-        audio   = np.concatenate(frames)
-        audio16 = stt._resample(audio, native_rate)
-        text    = stt.transcribe(audio16).strip()
+        audio = np.concatenate(frames)
 
+        # layer 1: audio gate — skip silent / too-short presses before STT
+        if not audio_ok(audio, native_rate):
+            continue
+
+        audio16 = stt._resample(audio, native_rate)
+        raw     = stt.transcribe(audio16)
+
+        # layer 2: text cleanup — fix artifacts, reject hallucinations
+        text = clean(raw)
         if not text:
             continue
 
-        # stream answer into HUD
-        _stream_answer(hud, text)
+        # reset cancel for this new call
+        cancel_event.clear()
 
-
-def _stream_answer(hud, question):
-    # ── opencode backend (commented out) ──────────────────────────────
-    # from opencode import opencode_stream
-    # cancel = threading.Event()
-    # try:
-    #     for chunk in opencode_stream(question, cancel_event=cancel):
-    #         hud.emitter.token.emit(chunk)
-    # except Exception as e:
-    #     hud.emitter.token.emit(f"[error: {e}]")
-    # finally:
-    #     hud.emitter.done.emit()
-
-    # ── MAF agent backend (Qwen3-27B, real tool use, streaming) ──
-    from agent import stream_answer as agent_stream
-    agent_stream(
-        question,
-        on_token=lambda text: hud.emitter.token.emit(text),
-        on_done=lambda: hud.emitter.done.emit(),
-    )
+        agent_stream(
+            text,
+            on_token=lambda t: hud.emitter.token.emit(t),
+            on_done=lambda: hud.emitter.done.emit(),
+            cancel_event=cancel_event,
+        )
 
 
 # ── main ─────────────────────────────────────────────────────────────────────

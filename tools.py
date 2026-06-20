@@ -264,10 +264,64 @@ def screenshot(
 # ── Exports ───────────────────────────────────────────────────────────
 
 
+@tool
+def subagent_launch(
+    name: Annotated[str, "Short slug for the task e.g. 'build-snake-ui'"],
+    prompt: Annotated[str, "Full task prompt — the agent will work autonomously on this"],
+) -> str:
+    """Spawn a fully autonomous detached sub-agent with its own session and tools.
+    It runs independently — survives even if you are killed. Returns agent_id."""
+    from subagent import launch
+    aid = launch(name, prompt)
+    return f"launched agent '{name}' → {aid}"
+
+
+@tool
+def subagent_status(
+    agent_id: Annotated[str, "agent_id returned by subagent_launch"],
+) -> str:
+    """Check status of a background agent (running/completed/failed/cancelled)."""
+    from subagent import status
+    import json
+    return json.dumps(status(agent_id), indent=2)
+
+
+@tool
+def subagent_list() -> str:
+    """List all background agents and their status."""
+    from subagent import list_all
+    import json
+    agents = list_all()
+    if not agents:
+        return "no agents"
+    return json.dumps(agents, indent=2)
+
+
+@tool
+def subagent_output(
+    agent_id: Annotated[str, "agent_id to read output from"],
+    tail: Annotated[int, "Number of lines from end of log"] = 50,
+) -> str:
+    """Read the last N lines of a background agent's output log."""
+    from subagent import read_output
+    return read_output(agent_id, tail=tail) or "(no output yet)"
+
+
+@tool
+def subagent_kill(
+    agent_id: Annotated[str, "agent_id to kill"],
+) -> str:
+    """Kill a running background agent."""
+    from subagent import kill
+    ok = kill(agent_id)
+    return "killed" if ok else "not found"
+
+
 def all_tools() -> list:
     """Return all built-in tool functions."""
     return [bash, read_file, write_file, edit_file, glob_files, grep_files,
-            web_fetch, web_search, screenshot]
+            web_fetch, web_search, screenshot,
+            subagent_launch, subagent_status, subagent_list, subagent_output, subagent_kill]
 
 
 def web_tools() -> list:

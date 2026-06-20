@@ -135,6 +135,15 @@ def main():
         print(f"[voice-hud] already running (pid {existing}). Kill it first.")
         return
 
+    # Detach stdin so F9 escape codes don't leak into the terminal
+    try:
+        import subprocess
+        devnull = open(os.devnull, "r")
+        os.dup2(devnull.fileno(), 0)
+        devnull.close()
+    except Exception:
+        pass
+
     from PyQt5.QtWidgets import QApplication
     from PyQt5.QtCore import QTimer
     from ui import HUD
@@ -154,6 +163,27 @@ def main():
 
     vt = threading.Thread(target=_voice_loop, args=(hud,), daemon=True)
     vt.start()
+
+    # agent status poller — refreshes HUD dashboard for all running agents
+    def _agent_poll():
+        import time
+        from subagent import list_all, _read_meta
+        while True:
+            try:
+                agents = list_all()
+                running = [a for a in agents if a["status"] == "running"]
+                # enrich with live output snippet from meta
+                for a in running:
+                    meta = _read_meta(a["agent_id"])
+                    if meta:
+                        a["output"] = meta.get("output", "")
+                hud.emitter.agents_update.emit(running)
+            except Exception:
+                pass
+            time.sleep(2)
+
+    at = threading.Thread(target=_agent_poll, daemon=True)
+    at.start()
 
     _write_pid()
     print(f"[voice-hud] running (pid {os.getpid()}) — hold F9 to speak")

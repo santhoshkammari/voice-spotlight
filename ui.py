@@ -1,31 +1,39 @@
 """
-HUD overlay — floats at top-center, always on top, click-through when idle.
-No input box. Voice only. Streams answer like a futuristic heads-up display.
+HUD overlay — macOS Spotlight style.
+Frosted glass, black/white, auto-expands as tokens stream.
 """
 
 import threading
 from PyQt5.QtWidgets import QWidget, QApplication, QDesktopWidget
-from PyQt5.QtCore import Qt, QPropertyAnimation, QEasingCurve, pyqtSignal, QObject, QTimer
-from PyQt5.QtGui import QPainter, QColor, QFont, QFontMetrics, QPen, QLinearGradient
+from PyQt5.QtCore import Qt, QPropertyAnimation, QEasingCurve, pyqtSignal, QObject, QTimer, QRect
+from PyQt5.QtGui import QPainter, QColor, QFont, QFontMetrics, QPen, QLinearGradient, QBrush
+import mdrender
 
 
-WIDTH  = 860
-HEIGHT = 220   # expanded height
-COLLAPSED_H = 4   # invisible sliver when idle (just a thin glow line)
+WIDTH       = 720
+PAD_H       = 22    # horizontal text padding
+PAD_TOP     = 52    # space above text (for search bar row)
+PAD_BOT     = 20
+LINE_H      = 22    # px per text line
+MIN_H       = 56    # height when just showing the bar (recording / idle)
+MAX_H       = 520
 
+RADIUS      = 14
 
-# Space-theme palette
-C_BG        = QColor(4,   6,  20, 230)   # near-black deep space
-C_BORDER    = QColor(0, 180, 255, 80)    # cyan glow border
-C_GLOW      = QColor(0, 200, 255, 18)    # soft outer glow fill
-C_TEXT      = QColor(200, 240, 255, 255) # ice-white text
-C_DIM       = QColor(80, 160, 200, 160)  # dimmer for status line
-C_ACCENT    = QColor(0, 220, 255, 255)   # bright cyan accent
-C_REC       = QColor(255, 60,  80, 255)  # red recording dot
+# Palette — monochrome glass
+C_BG        = QColor(18, 18, 18, 210)   # near-black, semi-transparent
+C_BORDER    = QColor(255, 255, 255, 28) # very subtle white border
+C_TEXT      = QColor(240, 240, 240, 255)
+C_DIM       = QColor(160, 160, 160, 200)
+C_REC       = QColor(255, 80,  80,  255)
+C_CURSOR    = QColor(255, 255, 255, 200)
+C_DIVIDER   = QColor(255, 255, 255, 18)
+C_HINT      = QColor(120, 120, 120, 140)
+C_CODE_BG   = QColor(40,  40,  40,  180)
+C_ACCENT    = QColor(100, 180, 255, 200)
 
-
-FONT_MAIN   = ("JetBrains Mono", "Fira Code", "Monospace")
-FONT_STATUS = ("SF Pro Display", "Segoe UI", "Ubuntu", "sans-serif")
+FONT_UI     = "SF Pro Display"
+FONT_MONO   = "JetBrains Mono"
 
 
 class Emitter(QObject):
@@ -34,6 +42,7 @@ class Emitter(QObject):
     show_recording = pyqtSignal()
     hide_recording = pyqtSignal()
     clear          = pyqtSignal()
+    agents_update  = pyqtSignal(list)   # list of agent dicts
 
 
 class HUD(QWidget):
@@ -42,8 +51,9 @@ class HUD(QWidget):
         self._text       = ""
         self._recording  = False
         self._expanded   = False
-        self._dot_phase  = 0       # animated recording dot
-        self._scan_phase = 0       # scan-line animation
+        self._dot_phase  = 0
+        self._agents     = []           # latest agent list for status panel
+        self._cur_h      = MIN_H
         self.emitter     = Emitter()
 
         self._build()
@@ -54,19 +64,20 @@ class HUD(QWidget):
         self.setWindowFlags(
             Qt.FramelessWindowHint
             | Qt.WindowStaysOnTopHint
-            | Qt.Tool                   # no taskbar entry
-            | Qt.X11BypassWindowManagerHint
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setAttribute(Qt.WA_ShowWithoutActivating)  # never steal focus
-        self.setFocusPolicy(Qt.NoFocus)
+        self.setWindowTitle("Voice Spotlight")
+        self.setMinimumSize(400, MIN_H)
 
-        # position: top-center of primary screen
         screen = QDesktopWidget().screenGeometry(0)
         x = screen.x() + (screen.width() - WIDTH) // 2
-        y = screen.y() + 18
-        self.setGeometry(x, y, WIDTH, COLLAPSED_H)
-        self.show()
+        y = screen.y() + int(screen.height() * 0.22)
+        self._x = x
+        self._y = y
+        self.setGeometry(x, y, WIDTH, MIN_H)
+        self._drag_pos = None
+        self._resize_edge = None
+        self.hide()
 
     def _connect(self):
         self.emitter.token.connect(self._on_token, Qt.QueuedConnection)
@@ -74,23 +85,21 @@ class HUD(QWidget):
         self.emitter.show_recording.connect(self._on_recording_start, Qt.QueuedConnection)
         self.emitter.hide_recording.connect(self._on_recording_stop, Qt.QueuedConnection)
         self.emitter.clear.connect(self._on_clear, Qt.QueuedConnection)
+        self.emitter.agents_update.connect(self._on_agents_update, Qt.QueuedConnection)
 
     def _start_timers(self):
-        # animate recording dot + scan line at 30fps
         self._anim_timer = QTimer()
-        self._anim_timer.setInterval(33)
+        self._anim_timer.setInterval(40)
         self._anim_timer.timeout.connect(self._tick)
         self._anim_timer.start()
 
-        # auto-collapse after 12s of no activity
         self._collapse_timer = QTimer()
         self._collapse_timer.setSingleShot(True)
         self._collapse_timer.timeout.connect(self._collapse)
 
     def _tick(self):
         if self._recording or self._expanded:
-            self._dot_phase  = (self._dot_phase  + 1) % 60
-            self._scan_phase = (self._scan_phase + 2) % HEIGHT
+            self._dot_phase = (self._dot_phase + 1) % 60
             self.update()
 
     # ── signals ───────────────────────────────────────────────────────────────
@@ -99,7 +108,8 @@ class HUD(QWidget):
         self._recording = True
         self._text = ""
         self._collapse_timer.stop()
-        self._expand()
+        self._set_height(MIN_H)
+        self.show()
         self.update()
 
     def _on_recording_stop(self):
@@ -109,42 +119,87 @@ class HUD(QWidget):
     def _on_token(self, text):
         self._text = text
         self._collapse_timer.stop()
-        self._expand()
+        self._expanded = True
+        self._reflow_height()
+        self.show()
         self.update()
 
     def _on_done(self):
-        self._collapse_timer.start(12000)   # collapse 12s after answer finishes
+        self._collapse_timer.start(10000)
 
     def _on_clear(self):
         self._text = ""
-        self._collapse()
+        if not self._agents:
+            self._collapse()
+        else:
+            self._reflow_height()
+            self.update()
 
-    # ── expand / collapse ─────────────────────────────────────────────────────
+    def _on_agents_update(self, agents: list):
+        self._agents = agents
+        if agents:
+            self._collapse_timer.stop()   # keep HUD alive while agents run
+            self._expanded = True
+            self._reflow_height()
+            self.show()
+        else:
+            # no more running agents — start collapse countdown if no text
+            if not self._text and not self._recording:
+                self._collapse_timer.start(5000)
+        self.update()
 
-    def _expand(self):
-        if self._expanded:
+    # ── layout ────────────────────────────────────────────────────────────────
+
+    def _reflow_height(self):
+        if not self._text:
+            if self._agents:
+                h = PAD_TOP + min(len(self._agents), 10) * 36 + PAD_BOT
+                self._set_height(max(MIN_H, h))
+            else:
+                self._set_height(MIN_H)
             return
-        self._expanded = True
-        self._anim(COLLAPSED_H, HEIGHT)
+        fm = QFontMetrics(QFont(FONT_MONO, 13))
+        avail_w = self.width() - PAD_H * 2
+        lines = 0
+        for para in self._text.split("\n"):
+            if not para:
+                lines += 1
+                continue
+            adv = fm.horizontalAdvance(para)
+            lines += max(1, (adv + avail_w - 1) // avail_w)
+        agent_h = (len(self._agents) * 36 + 12) if self._agents else 0
+        needed = PAD_TOP + lines * LINE_H + PAD_BOT + agent_h
+        h = max(MIN_H, min(needed, MAX_H))
+        self._set_height(int(h))
+
+    def _set_height(self, h):
+        if self._cur_h == h:
+            return
+        self._cur_h = h
+        if hasattr(self, "_anim_geo") and self._anim_geo.state() == QPropertyAnimation.Running:
+            self._anim_geo.stop()
+        cur = self.geometry()
+        self._anim_geo = QPropertyAnimation(self, b"geometry")
+        self._anim_geo.setDuration(180)
+        self._anim_geo.setStartValue(QRect(cur.x(), cur.y(), cur.width(), cur.height()))
+        self._anim_geo.setEndValue(QRect(cur.x(), cur.y(), cur.width(), h))
+        self._anim_geo.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim_geo.start()
 
     def _collapse(self):
-        if not self._expanded:
+        self._text = ""
+        self._recording = False
+        if self._agents:
+            # keep showing agent panel
+            self._expanded = True
+            self._reflow_height()
+            self.update()
             return
         self._expanded = False
-        self._text = ""
-        self._anim(self.height(), COLLAPSED_H)
-
-    def _anim(self, h0, h1):
-        screen = QDesktopWidget().screenGeometry(0)
-        x = screen.x() + (screen.width() - WIDTH) // 2
-        y = screen.y() + 18
-        self._a = QPropertyAnimation(self, b"geometry")
-        self._a.setDuration(260)
-        from PyQt5.QtCore import QRect
-        self._a.setStartValue(QRect(x, y, WIDTH, h0))
-        self._a.setEndValue(QRect(x, y, WIDTH, h1))
-        self._a.setEasingCurve(QEasingCurve.OutCubic)
-        self._a.start()
+        self.hide()
+        self._cur_h = MIN_H
+        cur = self.geometry()
+        self.setGeometry(cur.x(), cur.y(), cur.width(), MIN_H)
 
     # ── paint ─────────────────────────────────────────────────────────────────
 
@@ -154,134 +209,210 @@ class HUD(QWidget):
         p.setRenderHint(QPainter.TextAntialiasing)
         w, h = self.width(), self.height()
 
-        if h <= COLLAPSED_H + 2:
-            # collapsed: just a glowing line
-            p.setPen(Qt.NoPen)
-            grad = QLinearGradient(0, 0, w, 0)
-            grad.setColorAt(0.0, QColor(0, 0, 0, 0))
-            grad.setColorAt(0.3, C_ACCENT)
-            grad.setColorAt(0.7, C_ACCENT)
-            grad.setColorAt(1.0, QColor(0, 0, 0, 0))
-            p.setBrush(grad)
-            p.drawRect(0, 0, w, COLLAPSED_H)
-            return
-
-        # background
+        # frosted glass background
         p.setPen(Qt.NoPen)
         p.setBrush(C_BG)
-        p.drawRoundedRect(1, 1, w - 2, h - 2, 10, 10)
+        p.drawRoundedRect(0, 0, w, h, RADIUS, RADIUS)
 
-        # subtle scan-line shimmer
-        scan_y = self._scan_phase % h
-        scan_grad = QLinearGradient(0, scan_y - 6, 0, scan_y + 6)
-        scan_grad.setColorAt(0.0, QColor(0, 200, 255, 0))
-        scan_grad.setColorAt(0.5, QColor(0, 200, 255, 10))
-        scan_grad.setColorAt(1.0, QColor(0, 200, 255, 0))
-        p.setBrush(scan_grad)
-        p.drawRoundedRect(1, 1, w - 2, h - 2, 10, 10)
-
-        # border glow
-        pen = QPen(C_BORDER)
-        pen.setWidth(1)
-        p.setPen(pen)
+        # subtle border
+        p.setPen(QPen(C_BORDER, 1))
         p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(1, 1, w - 2, h - 2, 10, 10)
+        p.drawRoundedRect(0, 0, w, h, RADIUS, RADIUS)
 
-        # corner accents
-        p.setPen(QPen(C_ACCENT, 2))
-        aw = 18
-        # top-left
-        p.drawLine(4,      4,      4 + aw, 4)
-        p.drawLine(4,      4,      4,      4 + aw)
-        # top-right
-        p.drawLine(w - 4 - aw, 4,      w - 4, 4)
-        p.drawLine(w - 4,      4,      w - 4, 4 + aw)
-        # bottom-left
-        p.drawLine(4,          h - 4,  4 + aw, h - 4)
-        p.drawLine(4,          h - 4 - aw, 4,  h - 4)
-        # bottom-right
-        p.drawLine(w - 4 - aw, h - 4,  w - 4, h - 4)
-        p.drawLine(w - 4,      h - 4 - aw, w - 4, h - 4)
-
-        # ── status line ────────────────────────────────────────────────────
-        p.setPen(C_DIM)
-        sf = QFont(FONT_STATUS[0], 9)
-        sf.setFamily(", ".join(FONT_STATUS))
-        p.setFont(sf)
+        # ── top bar row ────────────────────────────────────────────────────
+        icon_x = PAD_H
+        icon_y = 14
 
         if self._recording:
-            # pulsing dot
-            pulse = abs(self._dot_phase - 30) / 30.0   # 0→1→0
-            dot_alpha = int(120 + 135 * pulse)
-            dot_color = QColor(255, 60, 80, dot_alpha)
-            p.setBrush(dot_color)
+            # pulsing red mic dot
+            pulse = abs(self._dot_phase - 30) / 30.0
+            alpha = int(180 + 75 * pulse)
+            p.setBrush(QColor(255, 80, 80, alpha))
             p.setPen(Qt.NoPen)
-            p.drawEllipse(16, 14, 8, 8)
-            p.setPen(QColor(255, 60, 80, dot_alpha))
-            p.drawText(30, 22, "RECORDING")
+            p.drawEllipse(icon_x, icon_y + 2, 10, 10)
+
+            p.setPen(QColor(255, 80, 80, alpha))
+            f = QFont(FONT_UI, 11)
+            p.setFont(f)
+            p.drawText(icon_x + 16, icon_y + 11, "Listening…")
         else:
+            # mic icon (simple circle + line)
+            p.setBrush(C_DIM)
+            p.setPen(Qt.NoPen)
+            p.drawEllipse(icon_x, icon_y + 2, 10, 10)
+
+            label = "Voice AI" if not self._text else "Response"
             p.setPen(C_DIM)
-            p.drawText(16, 22, "AI · VOICE")
+            f = QFont(FONT_UI, 11)
+            p.setFont(f)
+            p.drawText(icon_x + 16, icon_y + 11, label)
 
-        # right-side label
-        p.setPen(C_DIM)
-        label = "F9 to speak"
-        p.drawText(w - 90, 22, label)
+        # F9 hint right-aligned
+        p.setPen(C_HINT)
+        f2 = QFont(FONT_UI, 10)
+        p.setFont(f2)
+        p.drawText(0, icon_y, w - PAD_H, 14, Qt.AlignRight, "F9")
 
-        # separator line
-        p.setPen(QPen(QColor(0, 180, 255, 40), 1))
-        p.drawLine(14, 30, w - 14, 30)
-
-        # ── main text area ─────────────────────────────────────────────────
-        if not self._text and not self._recording:
-            p.setPen(QColor(60, 100, 140, 120))
-            hint_f = QFont(FONT_MAIN[0], 13)
-            hint_f.setFamily(", ".join(FONT_MAIN))
-            p.setFont(hint_f)
-            p.drawText(20, 34, w - 40, h - 44, Qt.TextWordWrap, "hold F9 · speak · release")
+        if h <= MIN_H + 4:
             p.end()
             return
 
-        tf = QFont(FONT_MAIN[0], 13)
-        tf.setFamily(", ".join(FONT_MAIN))
-        tf.setLetterSpacing(QFont.AbsoluteSpacing, 0.3)
-        p.setFont(tf)
-        p.setPen(C_TEXT)
+        # divider
+        p.setPen(QPen(C_DIVIDER, 1))
+        p.drawLine(PAD_H, 40, w - PAD_H, 40)
 
-        text_rect_x = 20
-        text_rect_y = 38
-        text_rect_w = w - 40
-        text_rect_h = h - 50
+        # ── text area ──────────────────────────────────────────────────────
+        if not self._text and not self._agents:
+            p.setPen(C_HINT)
+            hf = QFont(FONT_UI, 13)
+            p.setFont(hf)
+            p.drawText(PAD_H, PAD_TOP, w - PAD_H * 2, h - PAD_TOP - PAD_BOT,
+                       Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignVCenter,
+                       "Hold F9, speak, release…")
+            p.end()
+            return
 
-        p.drawText(text_rect_x, text_rect_y, text_rect_w, text_rect_h,
-                   Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop,
-                   self._text)
+        # agents only (no text)
+        if not self._text and self._agents:
+            self._paint_agents(p, w, PAD_TOP, h)
+            p.end()
+            return
 
-        # trailing cursor blink
-        if self._recording or self._dot_phase < 30:
-            fm = QFontMetrics(tf)
-            lines = self._text.split("\n")
-            last_line = lines[-1] if lines else ""
-            # estimate last-line x
-            wrapped_lines = []
-            for line in lines:
-                while fm.horizontalAdvance(line) > text_rect_w:
-                    for cut in range(len(line), 0, -1):
-                        if fm.horizontalAdvance(line[:cut]) <= text_rect_w:
-                            wrapped_lines.append(line[:cut])
-                            line = line[cut:]
-                            break
-                wrapped_lines.append(line)
-            cx = text_rect_x + fm.horizontalAdvance(wrapped_lines[-1] if wrapped_lines else "")
-            cy = text_rect_y + (len(wrapped_lines) - 1) * fm.height()
-            p.setPen(C_ACCENT)
-            p.drawText(cx + 2, cy + fm.ascent(), "▋")
+        # text (+ maybe agents below) — rendered as markdown
+        tx = PAD_H
+        ty = PAD_TOP
+        tw = w - PAD_H * 2
+        agent_panel_h = (len(self._agents) * 36 + 12) if self._agents else 0
+        th = h - PAD_TOP - PAD_BOT - agent_panel_h
+
+        base_font = QFont(FONT_UI, 13)
+        end_y = mdrender.draw(
+            p, self._text,
+            tx, ty, tw, th,
+            base_font, C_TEXT, C_DIM, C_CODE_BG, C_ACCENT,
+        )
+
+        # blinking cursor after last rendered line
+        if self._dot_phase < 30:
+            p.setPen(C_CURSOR)
+            p.setFont(QFont(FONT_MONO, 13))
+            p.drawText(tx, end_y, "▎")
+
+        # agent strip at bottom when text + agents coexist
+        if self._agents:
+            strip_y = h - agent_panel_h
+            p.setPen(QPen(C_DIVIDER, 1))
+            p.drawLine(PAD_H, strip_y, w - PAD_H, strip_y)
+            self._paint_agents(p, w, strip_y + 8, h)
 
         p.end()
 
-    # prevent the widget from ever accepting clicks / focus
-    def mousePressEvent(self, e):
-        e.ignore()
+    def _paint_agents(self, p, w, y_start, h):
+        STATUS_COLOR = {
+            "running":   QColor(80,  200, 120, 220),
+            "completed": QColor(120, 120, 120, 180),
+            "failed":    QColor(255,  80,  80, 220),
+            "cancelled": QColor(160, 160, 160, 140),
+        }
+        row_h = 36
+        y = y_start
+        name_f  = QFont(FONT_UI,   11); name_f.setBold(True)
+        snip_f  = QFont(FONT_MONO, 9)
+        name_fm = QFontMetrics(name_f)
+        snip_fm = QFontMetrics(snip_f)
 
-    def focusInEvent(self, e):
-        e.ignore()
+        for agent in self._agents[:10]:
+            if y + row_h > h:
+                break
+            st  = agent.get("status", "?")
+            col = STATUS_COLOR.get(st, C_DIM)
+            if st == "running":
+                pulse = abs(self._dot_phase - 30) / 30.0
+                col = QColor(80, 200, 120, int(160 + 60 * pulse))
+
+            # dot
+            p.setPen(Qt.NoPen)
+            p.setBrush(col)
+            p.drawEllipse(PAD_H, y + 6, 8, 8)
+
+            # name
+            p.setFont(name_f)
+            p.setPen(C_TEXT)
+            name = agent.get("name", agent.get("agent_id", "?"))
+            p.drawText(PAD_H + 16, y + name_fm.ascent(), name)
+
+            # status badge right
+            p.setFont(snip_f)
+            p.setPen(col)
+            p.drawText(0, y, w - PAD_H, 16, Qt.AlignRight | Qt.AlignVCenter, st)
+
+            # last output snippet
+            snippet = ""
+            out = agent.get("output", "")
+            if out:
+                last = [l.strip() for l in out.splitlines() if l.strip()]
+                snippet = last[-1][:80] if last else ""
+            if snippet:
+                p.setFont(snip_f)
+                p.setPen(C_DIM)
+                p.drawText(PAD_H + 16, y + name_fm.height() + snip_fm.ascent() - 2, snippet)
+
+            y += row_h
+
+    # ── drag to move + edge resize ────────────────────────────────────────
+
+    RESIZE_MARGIN = 8
+
+    def _edge(self, pos):
+        x, y, w, h = pos.x(), pos.y(), self.width(), self.height()
+        m = self.RESIZE_MARGIN
+        bottom = y > h - m
+        right  = x > w - m
+        left   = x < m
+        if bottom and right: return "br"
+        if bottom and left:  return "bl"
+        if bottom:           return "b"
+        if right:            return "r"
+        if left:             return "l"
+        return None
+
+    def mousePressEvent(self, e):
+        from PyQt5.QtCore import Qt as _Qt
+        if e.button() == _Qt.LeftButton:
+            edge = self._edge(e.pos())
+            if edge:
+                self._resize_edge = edge
+                self._resize_start_geo = self.geometry()
+                self._resize_start_pos = e.globalPos()
+            else:
+                self._drag_pos = e.globalPos() - self.frameGeometry().topLeft()
+                self._resize_edge = None
+
+    def mouseMoveEvent(self, e):
+        from PyQt5.QtCore import Qt as _Qt
+        if e.buttons() & _Qt.LeftButton:
+            if self._resize_edge:
+                delta = e.globalPos() - self._resize_start_pos
+                g = self._resize_start_geo
+                x, y, w, h = g.x(), g.y(), g.width(), g.height()
+                edge = self._resize_edge
+                if "r" in edge: w = max(400, w + delta.x())
+                if "l" in edge: x += delta.x(); w = max(400, w - delta.x())
+                if "b" in edge: h = max(MIN_H, h + delta.y())
+                self.setGeometry(x, y, w, h)
+                self._cur_h = h
+            elif self._drag_pos:
+                self.move(e.globalPos() - self._drag_pos)
+        else:
+            edge = self._edge(e.pos())
+            from PyQt5.QtCore import Qt as _Qt
+            cursors = {
+                "br": _Qt.SizeFDiagCursor, "bl": _Qt.SizeBDiagCursor,
+                "b":  _Qt.SizeVerCursor,
+                "r":  _Qt.SizeHorCursor,  "l":  _Qt.SizeHorCursor,
+            }
+            self.setCursor(cursors.get(edge, _Qt.ArrowCursor))
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+        self._resize_edge = None

@@ -146,7 +146,7 @@ async def _run_stream(
     full = ""
     interrupted = False
 
-    stream = Runner.run_streamed(_agent, input_msgs)
+    stream = Runner.run_streamed(_agent, input_msgs, max_turns=None)
     async for event in stream.stream_events():
         if cancel_event and cancel_event.is_set() and not interrupted:
             interrupted = True

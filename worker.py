@@ -103,7 +103,7 @@ async def _run_gpu(agent_id: str, name: str, prompt: str, history: list[dict]) -
 
     input_msgs = history + [{"role": "user", "content": prompt}]
     full = ""
-    stream = Runner.run_streamed(agent, input_msgs)
+    stream = Runner.run_streamed(agent, input_msgs, max_turns=None)
     async for event in stream.stream_events():
         if isinstance(event, RawResponsesStreamEvent):
             data = event.data

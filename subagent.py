@@ -57,19 +57,24 @@ def _is_alive(pid: int) -> bool:
 
 def _refresh_status(agent_id: str) -> dict:
     meta = _read_meta(agent_id)
-    if not meta:
+    if not meta or not isinstance(meta, dict):
         return {"agent_id": agent_id, "status": "unknown"}
-    if meta["status"] == "running":
+    if meta.get("status") == "running":
         pid = meta.get("pid")
         if pid and not _is_alive(pid):
-            # process died — check exit code via sentinel file
-            sentinel = AGENTS_DIR / f"{agent_id}.exit"
-            if sentinel.exists():
-                code = sentinel.read_text().strip()
-                meta["status"] = "completed" if code == "0" else "failed"
-            else:
-                meta["status"] = "failed"
-            _write_meta(agent_id, meta)
+            # re-read meta — worker may have updated status itself before dying
+            meta = _read_meta(agent_id) or meta
+            if not isinstance(meta, dict):
+                meta = {"agent_id": agent_id}
+            if meta.get("status") == "running":
+                # still running in meta but pid dead — check sentinel
+                sentinel = AGENTS_DIR / f"{agent_id}.exit"
+                if sentinel.exists():
+                    code = sentinel.read_text().strip()
+                    meta["status"] = "completed" if code == "0" else "failed"
+                else:
+                    meta["status"] = "failed"
+                _write_meta(agent_id, meta)
     return meta
 
 
@@ -133,15 +138,24 @@ def status(agent_id: str) -> dict:
 
 def list_all(*, include_completed: bool = True) -> list[dict]:
     agents = []
-    for p in sorted(AGENTS_DIR.glob("*.json")):
+    for p in sorted(AGENTS_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+        # skip session history files and tmp files
+        if ".session." in p.name or p.suffix != ".json" or p.stem.endswith(".session"):
+            continue
         agent_id = p.stem
-        meta = _refresh_status(agent_id)
-        if not include_completed and meta["status"] not in ("running",):
+        try:
+            meta = _refresh_status(agent_id)
+        except Exception:
+            continue
+        if not isinstance(meta, dict) or not meta.get("agent_id") and not meta.get("name"):
+            continue
+        status = meta.get("status", "unknown")
+        if not include_completed and status not in ("running",):
             continue
         agents.append({
             "agent_id": agent_id,
-            "name": meta.get("name", "?"),
-            "status": meta["status"],
+            "name": meta.get("name", agent_id),
+            "status": status,
             "started": meta.get("started"),
             "prompt_preview": meta.get("prompt", "")[:80],
         })

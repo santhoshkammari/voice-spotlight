@@ -172,6 +172,7 @@ def main():
 
     history = _load_worker_history(agent_id)
 
+    sentinel = AGENTS_DIR / f"{agent_id}.exit"
     try:
         if _gpu_reachable():
             history = _compress(history, 250000)
@@ -185,9 +186,11 @@ def main():
         history.append({"role": "assistant",  "content": result})
         _save_worker_history(agent_id, history)
         _patch(agent_id, status="completed", output=result[-4000:], updated=time.time())
+        sentinel.write_text("0")
 
     except Exception as e:
         _patch(agent_id, status="failed", output=f"[error] {e}", updated=time.time())
+        sentinel.write_text("1")
         sys.exit(1)
 
 

@@ -54,8 +54,9 @@ class HUD(QWidget):
         self._dot_phase  = 0
         self._agents     = []
         self._cur_h      = MIN_H
-        self._scroll_y      = 0    # pixels scrolled from top of content
-        self._user_scrolled = False  # True once user manually scrolls up
+        self._scroll_y      = 0
+        self._user_scrolled = False
+        self._open_btn_rect = None
         self.emitter     = Emitter()
 
         self._build()
@@ -65,7 +66,6 @@ class HUD(QWidget):
     def _build(self):
         self.setWindowFlags(
             Qt.FramelessWindowHint
-            | Qt.Tool
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle("Voice Spotlight")
@@ -108,11 +108,7 @@ class HUD(QWidget):
 
     def _on_recording_start(self):
         self._recording = True
-        self._text = ""
-        self._scroll_y = 0
-        self._user_scrolled = False
         self._collapse_timer.stop()
-        self._set_height(MIN_H, animate=False)
         self.show()
         self.update()
 
@@ -284,11 +280,24 @@ class HUD(QWidget):
             p.setFont(f)
             p.drawText(icon_x + 16, icon_y + 11, label)
 
-        # F9 hint right-aligned
-        p.setPen(C_HINT)
-        f2 = QFont(FONT_UI, 10)
+        # "Open" button — top right
+        btn_w, btn_h = 46, 20
+        btn_x = w - PAD_H - btn_w
+        btn_y = icon_y + 1
+        self._open_btn_rect = (btn_x, btn_y, btn_w, btn_h)
+        p.setBrush(QColor(50, 50, 50, 180))
+        p.setPen(QPen(QColor(255, 255, 255, 30), 1))
+        p.drawRoundedRect(btn_x, btn_y, btn_w, btn_h, 5, 5)
+        p.setPen(QColor(180, 180, 180, 220))
+        f2 = QFont(FONT_UI, 9)
         p.setFont(f2)
-        p.drawText(0, icon_y, w - PAD_H, 14, Qt.AlignRight, "F9")
+        p.drawText(btn_x, btn_y, btn_w, btn_h, Qt.AlignCenter, "Open")
+
+        # F9 hint — left of button
+        p.setPen(C_HINT)
+        f3 = QFont(FONT_UI, 10)
+        p.setFont(f3)
+        p.drawText(0, icon_y, btn_x - 4, 14, Qt.AlignRight, "F9")
 
         if h <= MIN_H + 4:
             p.end()
@@ -423,6 +432,14 @@ class HUD(QWidget):
     def mousePressEvent(self, e):
         from PyQt5.QtCore import Qt as _Qt
         if e.button() == _Qt.LeftButton:
+            # check "Open" button hit
+            r = getattr(self, "_open_btn_rect", None)
+            if r:
+                bx, by, bw, bh = r
+                if bx <= e.pos().x() <= bx + bw and by <= e.pos().y() <= by + bh:
+                    from chat import open_chat
+                    open_chat()
+                    return
             edge = self._edge(e.pos())
             if edge:
                 self._resize_edge = edge

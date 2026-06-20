@@ -1,8 +1,8 @@
 """
 voice-hud — background daemon
   • python run.py        start (stays running, no window in taskbar)
-  • hold F9             record speech → STT → streams answer into HUD
-  • Esc (hold F9 then)  not needed — HUD auto-collapses after 12s
+  • hold Ctrl+F11       record speech → STT → streams answer into HUD
+  • release Ctrl+F11    stops recording, sends to AI
   • kill the process    to stop
 """
 
@@ -12,7 +12,6 @@ import signal
 import threading
 
 PID_FILE     = os.path.expanduser("~/.voice-spotlight/daemon.pid")
-VOICE_HOTKEY = "F9"
 
 
 # ── pid helpers ──────────────────────────────────────────────────────────────
@@ -53,9 +52,6 @@ def _voice_loop(hud):
     from pynput import keyboard
     import stt
 
-    key_map = {f"F{i}": getattr(keyboard.Key, f"f{i}") for i in range(1, 13)}
-    target_key = key_map.get(VOICE_HOTKEY.upper(), keyboard.Key.f9)
-
     device_info = sd.query_devices(kind="input")
     native_rate = int(device_info["default_samplerate"])
 
@@ -72,7 +68,7 @@ def _voice_loop(hud):
                 frames.append(indata[:, 0].copy())
 
         def on_press(key):
-            if key == target_key and not recording[0]:
+            if key == keyboard.Key.f9 and not recording[0]:
                 recording[0] = True
                 hud.emitter.show_recording.emit()
                 stream_ref[0] = sd.InputStream(
@@ -81,7 +77,7 @@ def _voice_loop(hud):
                 stream_ref[0].start()
 
         def on_release(key):
-            if key == target_key and recording[0]:
+            if key == keyboard.Key.f9 and recording[0]:
                 recording[0] = False
                 if stream_ref[0]:
                     stream_ref[0].stop()
@@ -160,7 +156,7 @@ def main():
     vt.start()
 
     _write_pid()
-    print(f"[voice-hud] running (pid {os.getpid()}) — hold {VOICE_HOTKEY} to speak")
+    print(f"[voice-hud] running (pid {os.getpid()}) — hold F9 to speak")
     try:
         sys.exit(app.exec_())
     finally:

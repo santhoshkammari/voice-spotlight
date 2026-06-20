@@ -22,8 +22,8 @@ from tools import all_tools
 
 import os
 
-BASE_URL = os.environ.get("LLM_BASE_URL", "http://0.0.0.0:8077/v1")
-MODEL_ID = os.environ.get("LLM_MODEL_ID", "qwen3-6-27b")
+BASE_URL = os.environ.get("LLM_BASE_URL", "http://192.168.170.49:8077/v1")
+MODEL_ID = os.environ.get("LLM_MODEL_ID", "/home/ng6355/models/qwen3-6-27b")
 
 set_tracing_disabled(True)
 
@@ -79,17 +79,49 @@ async def _run_stream(question: str, on_token: Callable[[str], None]) -> None:
             _history.pop(0)
 
 
-def stream_answer(question: str, on_token: Callable[[str], None], on_done: Callable[[], None]) -> None:
-    """
-    Blocking call — runs in a background thread.
-    Calls on_token(cumulative_text) for each delta, on_done() when finished.
-    """
-    async def _go():
+def _gpu_reachable() -> bool:
+    import socket
+    try:
+        s = socket.create_connection(("192.168.170.49", 8077), timeout=2)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def _opencode_stream(question: str, on_token: Callable[[str], None]) -> None:
+    import subprocess, json
+    cmd = [
+        "/home/ntlpt24/.opencode/bin/opencode", "run", question,
+        "--model", "opencode/deepseek-v4-flash-free",
+        "--format", "json",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            cwd="/home/ntlpt24")
+    full = ""
+    for line in proc.stdout:
         try:
-            await _run_stream(question, on_token)
+            obj = json.loads(line)
+            if obj.get("type") == "text":
+                full += obj["part"]["text"]
+                on_token(full)
+        except Exception:
+            pass
+    proc.wait()
+
+
+def stream_answer(question: str, on_token: Callable[[str], None], on_done: Callable[[], None]) -> None:
+    """Tries GPU4/Qwen3 first, falls back to opencode if unreachable."""
+    def _go():
+        try:
+            if _gpu_reachable():
+                asyncio.run(_run_stream(question, on_token))
+            else:
+                on_token("[GPU offline → opencode]\n\n")
+                _opencode_stream(question, on_token)
         except Exception as e:
-            on_token(f"[agent error: {e}]")
+            on_token(f"[error: {e}]")
         finally:
             on_done()
 
-    asyncio.run(_go())
+    threading.Thread(target=_go, daemon=True).start()

@@ -1,9 +1,9 @@
 """
 voice-hud — background daemon
-  • python run.py        start (stays running, no window in taskbar)
-  • hold Ctrl+F11       record speech → STT → streams answer into HUD
-  • release Ctrl+F11    stops recording, sends to AI
-  • kill the process    to stop
+  • launch via desktop icon or start.sh   start (tray icon appears)
+  • hold F9                               record speech → STT → streams answer into HUD
+  • release F9                            stops recording, sends to AI
+  • tray icon → Stop                      quits the app (tray icon disappears)
 """
 
 import os
@@ -145,13 +145,19 @@ def main():
         pass
 
     from PyQt5.QtWidgets import QApplication
-    from PyQt5.QtCore import QTimer
+    from PyQt5.QtCore import QTimer, Qt
     from ui import HUD
+    from tray import Tray
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
     hud = HUD()
+    tray = Tray(on_quit=lambda: hud.emitter.quit_requested.emit())
+    hud.emitter.show_recording.connect(lambda: tray.set_recording(True))
+    hud.emitter.hide_recording.connect(lambda: tray.set_recording(False))
+    hud.emitter.quit_requested.connect(app.quit, Qt.QueuedConnection)
+    tray.start()
 
     signal.signal(signal.SIGINT,  lambda *_: app.quit())
     signal.signal(signal.SIGTERM, lambda *_: app.quit())
@@ -186,10 +192,11 @@ def main():
     at.start()
 
     _write_pid()
-    print(f"[voice-hud] running (pid {os.getpid()}) — hold F9 to speak")
+    print(f"[voice-hud] running (pid {os.getpid()}) — hold F9 to speak, tray icon to stop")
     try:
         sys.exit(app.exec_())
     finally:
+        tray.stop()
         _clear_pid()
 
 

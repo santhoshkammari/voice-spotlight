@@ -43,6 +43,7 @@ class Emitter(QObject):
     hide_recording = pyqtSignal()
     clear          = pyqtSignal()
     agents_update  = pyqtSignal(list)   # list of agent dicts
+    quit_requested = pyqtSignal()       # tray "Stop" clicked, fired from pystray's thread
 
 
 class HUD(QWidget):
